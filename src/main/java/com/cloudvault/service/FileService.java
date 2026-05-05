@@ -4,13 +4,21 @@ import com.cloudvault.model.FileMetadata;
 import com.cloudvault.model.User;
 import com.cloudvault.repository.FileRepository;
 import com.cloudvault.repository.UserRepository;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
+@Slf4j
 @Service
 public class FileService {
 
@@ -23,17 +31,23 @@ public class FileService {
     @Autowired
     private EncryptionService encryptionService;
 
-    // We'll define chunk size as 1MB for this project
-    private static final int CHUNK_SIZE = 1024 * 1024;
+    @Autowired
+    private HdfsService hdfsService;
+
+    // Increase Chunk Size to 8MB to reduce process overhead
+    private static final int CHUNK_SIZE = 8 * 1024 * 1024;
+
+    // Create a pool to handle parallel HDFS commands
+    private final ExecutorService executor = Executors.newFixedThreadPool(4);
 
     public FileMetadata uploadFile(MultipartFile file, String username) throws Exception {
+        log.info("Starting Parallel Upload: {}", file.getOriginalFilename());
+
         User owner = userRepository.findByUsername(username)
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
-        // 1. Generate unique AES key for this file
         String fileKey = encryptionService.generateKey();
 
-        // 2. Create and save metadata to Postgres
         FileMetadata metadata = FileMetadata.builder()
                 .fileName(file.getOriginalFilename())
                 .contentType(file.getContentType())
@@ -42,35 +56,78 @@ public class FileService {
                 .owner(owner)
                 .build();
 
-        metadata = fileRepository.save(metadata);
+        final FileMetadata savedMetadata = fileRepository.save(metadata);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-        // 3. Chunking & Encryption Logic
         try (InputStream is = file.getInputStream()) {
             byte[] buffer = new byte[CHUNK_SIZE];
             int bytesRead;
             int chunkIndex = 0;
 
             while ((bytesRead = is.read(buffer)) != -1) {
-                // If the last chunk is smaller than CHUNK_SIZE, we trim the buffer
-                byte[] actualChunk = (bytesRead == CHUNK_SIZE)
-                        ? buffer
+                final int index = chunkIndex;
+                final byte[] chunkToProcess = (bytesRead == CHUNK_SIZE)
+                        ? buffer.clone()
                         : Arrays.copyOf(buffer, bytesRead);
 
-                // Encrypt this specific chunk
-                byte[] encryptedChunk = encryptionService.encrypt(actualChunk, fileKey);
+                // Submit each chunk as a separate parallel task
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    try {
+                        byte[] encrypted = encryptionService.encrypt(chunkToProcess, fileKey);
+                        hdfsService.storeChunk(encrypted, savedMetadata.getId(), index);
+                        log.info("Chunk {} uploaded successfully", index);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to upload chunk " + index, e);
+                    }
+                }, executor);
 
-                // TODO: In Step 10, we will call HDFS to store this 'encryptedChunk'
-                // For now, we just simulate the storage log
-                System.out.println("Storing chunk " + chunkIndex + " for file: " + metadata.getFileName());
-
+                futures.add(future);
                 chunkIndex++;
             }
 
-            // Update total chunks in metadata
-            metadata.setTotalChunks(chunkIndex);
-            fileRepository.save(metadata);
+            // Wait for all chunks to finish
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            savedMetadata.setTotalChunks(chunkIndex);
+            return fileRepository.save(savedMetadata);
+        }
+    }
+
+    public byte[] downloadFile(Long fileId) throws Exception {
+        FileMetadata metadata = fileRepository.findById(fileId)
+                .orElseThrow(() -> new RuntimeException("File not found"));
+
+        int total = metadata.getTotalChunks();
+        byte[][] allChunks = new byte[total][];
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        log.info("Starting Parallel Download for {} chunks", total);
+
+        for (int i = 0; i < total; i++) {
+            final int index = i;
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    byte[] encrypted = hdfsService.getChunk(fileId, index);
+                    byte[] decrypted = encryptionService.decrypt(encrypted, metadata.getEncryptionKey());
+                    allChunks[index] = decrypted; // Put in correct position
+                    log.info("Chunk {} downloaded and decrypted", index);
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to download chunk " + index, e);
+                }
+            }, executor);
+
+            futures.add(future);
         }
 
-        return metadata;
+        // Wait for all downloads
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        // Merge in order
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        for (byte[] chunk : allChunks) {
+            outputStream.write(chunk);
+        }
+
+        return outputStream.toByteArray();
     }
 }

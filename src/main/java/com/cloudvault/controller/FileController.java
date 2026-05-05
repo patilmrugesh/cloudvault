@@ -33,4 +33,16 @@ public class FileController {
             return ResponseEntity.internalServerError().body("Upload failed: " + e.getMessage());
         }
     }
+
+    @GetMapping("/download/{id}")
+    public ResponseEntity<byte[]> downloadFile(@PathVariable Long id) {
+        try {
+            byte[] fileData = fileService.downloadFile(id);
+            return ResponseEntity.ok()
+                    .header("Content-Disposition", "attachment; filename=\"cloudvault_file\"")
+                    .body(fileData);
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().build();
+        }
+    }
 }
