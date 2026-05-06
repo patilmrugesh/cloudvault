@@ -1,7 +1,9 @@
 package com.cloudvault.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.*;
+
 import java.time.LocalDateTime;
 
 @Entity
@@ -24,18 +26,28 @@ public class FileMetadata {
 
     private Long fileSize;
 
-    // Track how many chunks the file was split into for HDFS storage
     private Integer totalChunks;
 
-    // The AES key used to encrypt this specific file's chunks
+    // Hidden from JSON responses — but still readable internally via getter
+    @JsonIgnore
     @Column(nullable = false)
     private String encryptionKey;
 
     private LocalDateTime uploadDate;
 
-    @ManyToOne
+    // FIX: EAGER so owner.getUsername() never triggers LazyInitializationException
+    // outside a transaction (e.g. inside CompletableFuture threads).
+    // @JsonIgnore prevents the full User object being serialised into API responses.
+    @JsonIgnore
+    @ManyToOne(fetch = FetchType.EAGER)
     @JoinColumn(name = "user_id")
     private User owner;
+
+    // Expose only the username string in API responses — not the full User entity
+    @Transient
+    public String getOwnerUsername() {
+        return owner != null ? owner.getUsername() : null;
+    }
 
     @PrePersist
     protected void onCreate() {

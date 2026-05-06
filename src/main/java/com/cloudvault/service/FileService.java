@@ -4,6 +4,7 @@ import com.cloudvault.model.FileMetadata;
 import com.cloudvault.model.User;
 import com.cloudvault.repository.FileRepository;
 import com.cloudvault.repository.UserRepository;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -14,9 +15,8 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Slf4j
 @Service
@@ -32,19 +32,43 @@ public class FileService {
     private EncryptionService encryptionService;
 
     @Autowired
-    private HdfsService hdfsService;
+    private MinioService minioService;
 
-    // Increase Chunk Size to 8MB to reduce process overhead
-    private static final int CHUNK_SIZE = 8 * 1024 * 1024;
+    private static final int CHUNK_SIZE = 2 * 1024 * 1024;
 
-    // Create a pool to handle parallel HDFS commands
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
 
+    @PreDestroy
+    public void shutdownExecutor() {
+        log.info("Shutting down FileService executor...");
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public FileMetadata getFileMetadata(Long id) {
+        return fileRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("File not found with id: " + id));
+    }
+
+    public List<FileMetadata> getUserFiles(String username) {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new RuntimeException("User not found: " + username));
+        return fileRepository.findByOwner(user);
+    }
+
     public FileMetadata uploadFile(MultipartFile file, String username) throws Exception {
+
         log.info("Starting Parallel Upload: {}", file.getOriginalFilename());
 
         User owner = userRepository.findByUsername(username)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+                .orElseThrow(() -> new RuntimeException("User not found: " + username));
 
         String fileKey = encryptionService.generateKey();
 
@@ -57,27 +81,32 @@ public class FileService {
                 .build();
 
         final FileMetadata savedMetadata = fileRepository.save(metadata);
+
+        AtomicReference<Exception> firstError = new AtomicReference<>(null);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         try (InputStream is = file.getInputStream()) {
+
             byte[] buffer = new byte[CHUNK_SIZE];
             int bytesRead;
             int chunkIndex = 0;
 
             while ((bytesRead = is.read(buffer)) != -1) {
+
                 final int index = chunkIndex;
                 final byte[] chunkToProcess = (bytesRead == CHUNK_SIZE)
                         ? buffer.clone()
                         : Arrays.copyOf(buffer, bytesRead);
 
-                // Submit each chunk as a separate parallel task
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    if (firstError.get() != null) return;
                     try {
                         byte[] encrypted = encryptionService.encrypt(chunkToProcess, fileKey);
-                        hdfsService.storeChunk(encrypted, savedMetadata.getId(), index);
+                        minioService.storeChunk(encrypted, savedMetadata.getId(), index);
                         log.info("Chunk {} uploaded successfully", index);
                     } catch (Exception e) {
-                        throw new RuntimeException("Failed to upload chunk " + index, e);
+                        firstError.compareAndSet(null, e);
+                        throw new CompletionException("Failed to upload chunk " + index, e);
                     }
                 }, executor);
 
@@ -85,49 +114,92 @@ public class FileService {
                 chunkIndex++;
             }
 
-            // Wait for all chunks to finish
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            try {
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            } catch (CompletionException ce) {
+                Exception root = firstError.get();
+                throw (root != null) ? root : new RuntimeException(ce.getCause());
+            }
+
+            if (firstError.get() != null) throw firstError.get();
 
             savedMetadata.setTotalChunks(chunkIndex);
             return fileRepository.save(savedMetadata);
         }
     }
 
-    public byte[] downloadFile(Long fileId) throws Exception {
-        FileMetadata metadata = fileRepository.findById(fileId)
-                .orElseThrow(() -> new RuntimeException("File not found"));
+    public byte[] downloadFile(Long fileId, String username) throws Exception {
 
-        int total = metadata.getTotalChunks();
+        FileMetadata metadata = fileRepository.findById(fileId)
+                .orElseThrow(() -> new RuntimeException("File not found with id: " + fileId));
+
+        // FIX: owner is now EAGER so this never throws LazyInitializationException
+        if (!metadata.getOwner().getUsername().equals(username)) {
+            throw new SecurityException("Access denied: you do not own this file");
+        }
+
+        // FIX: snapshot both values from the entity on the main thread,
+        //      BEFORE handing work off to async threads.
+        //      Accessing a managed entity's fields inside CompletableFuture
+        //      can hit detached-entity issues depending on JPA provider config.
+        final String encryptionKey = metadata.getEncryptionKey();
+        final Integer total = metadata.getTotalChunks();
+
+        if (encryptionKey == null || encryptionKey.isBlank()) {
+            throw new RuntimeException(
+                    "Encryption key is missing for file id: " + fileId +
+                            ". The database record may be corrupt.");
+        }
+
+        if (total == null || total <= 0) {
+            throw new RuntimeException(
+                    "File metadata is corrupt: invalid chunk count for file id: " + fileId);
+        }
+
+        log.info("Starting Parallel Download for {} chunks (fileId={})", total, fileId);
+
         byte[][] allChunks = new byte[total][];
+        AtomicReference<Exception> firstError = new AtomicReference<>(null);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-        log.info("Starting Parallel Download for {} chunks", total);
-
         for (int i = 0; i < total; i++) {
+
             final int index = i;
+
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                if (firstError.get() != null) return;
                 try {
-                    byte[] encrypted = hdfsService.getChunk(fileId, index);
-                    byte[] decrypted = encryptionService.decrypt(encrypted, metadata.getEncryptionKey());
-                    allChunks[index] = decrypted; // Put in correct position
+                    byte[] encrypted = minioService.getChunk(fileId, index);
+
+                    // FIX: use the snapshotted key — not metadata.getEncryptionKey()
+                    //      which could be null if Hibernate detaches the entity
+                    byte[] decrypted = encryptionService.decrypt(encrypted, encryptionKey);
+
+                    allChunks[index] = decrypted;
                     log.info("Chunk {} downloaded and decrypted", index);
+
                 } catch (Exception e) {
-                    throw new RuntimeException("Failed to download chunk " + index, e);
+                    firstError.compareAndSet(null, e);
+                    throw new CompletionException("Failed to download chunk " + index, e);
                 }
             }, executor);
 
             futures.add(future);
         }
 
-        // Wait for all downloads
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (CompletionException ce) {
+            Exception root = firstError.get();
+            throw (root != null) ? root : new RuntimeException(ce.getCause());
+        }
 
-        // Merge in order
+        if (firstError.get() != null) throw firstError.get();
+
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
         for (byte[] chunk : allChunks) {
             outputStream.write(chunk);
         }
-
         return outputStream.toByteArray();
     }
 }
