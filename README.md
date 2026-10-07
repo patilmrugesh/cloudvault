@@ -1,262 +1,258 @@
-# ☁️ CloudVault
+# CloudVault Backend — Secure Distributed File Storage & Document RAG System
 
-> **Encrypted. Deduplicated. Unstoppable.**  
-> A production-grade cloud file storage system built with Spring Boot, MinIO, PostgreSQL, and React.
-
----
-
-## What is CloudVault?
-
-CloudVault is a self-hosted cloud storage backend that takes file storage seriously. Every file is split into chunks, encrypted with AES-256-GCM before it ever touches disk, deduplicated at the chunk level using SHA-256 hashing, and reassembled in parallel on download. Share files securely with signed URLs. Resume interrupted uploads from exactly where they left off.
-
-No vendor lock-in. No plaintext at rest. No wasted storage.
+A production-grade Spring Boot backend for a secure distributed cloud file storage and document intelligence platform. CloudVault combines **AES-256-GCM encryption**, **parallel chunked uploads/downloads**, **chunk deduplication**, **secure time-limited share links**, and an end-to-end **Retrieval-Augmented Generation (RAG)** pipeline powered by **Spring AI**, **Ollama**, and **PostgreSQL PGVector**.
 
 ---
 
-## Features
+## 🌟 Key Capabilities
 
-### 🔐 AES-256-GCM Encrypted Storage
-Every chunk is encrypted with a unique IV before hitting MinIO. The encryption key lives in PostgreSQL, never in the object store. Losing MinIO access means an attacker gets ciphertext — nothing more.
+### 1. Document Intelligence & Retrieval-Augmented Generation (RAG)
+- **Document Text Extraction**: Automated content extraction from PDF documents using Apache PDFBox 3.x and raw text files.
+- **Semantic Vector Embeddings**: Generates dense vector embeddings (768 dimensions) using Ollama with `nomic-embed-text`.
+- **Vector Store with PGVector**: Stores chunk embeddings in PostgreSQL using the `pgvector` extension with **HNSW** indexing and **Cosine Distance** similarity.
+- **Context-Augmented Querying**: Retrieves top-$k$ relevant document chunks filtered by `fileId` and user context to ground LLM inference.
+- **Reactive Token Streaming**: Streams responses in real-time using Server-Sent Events (`text/event-stream`) with Project Reactor `Flux<String>`.
+- **Three Intelligence Modes**:
+  - `SUMMARY`: Instant executive summaries and topic breakdowns.
+  - `DETAILED_NOTES`: In-depth analytical outlines and key takeaways.
+  - `QUESTION`: Conversational question-answering grounded strictly in document content.
 
-### ⚡ Parallel Chunked Transfer
-Files are split into 2 MB chunks and uploaded or downloaded concurrently using a `CompletableFuture` thread pool. Large files transfer significantly faster than single-stream approaches.
+### 2. Persistent AI Interaction History
+- **Conversation & Audit Persistence**: Automatically logs every AI request, query, generated response, and timestamp in the database via `AiHistory`.
+- **Per-File & Per-User Isolation**: Secure query isolation ensuring users can only review and retrieve AI interactions for files they own or have access to.
+- **Audit Retrieval API**: `GET /api/ai/documents/{fileId}/history` endpoint for loading previous conversation threads directly into the frontend.
 
-### 🔗 Secure Signed Share URLs
-Generate a time-limited share link for any file you own. Links expire automatically. Add an optional BCrypt-hashed password for a second layer of access control. Revoke any link instantly — no waiting for expiry.
+### 3. Cryptographic & File Security
+- **AES-256-GCM Authenticated Encryption**: Every uploaded file is encrypted with a unique key before persistence; zero plaintext is stored at rest.
+- **Random IV per Chunk**: Cryptographically randomized Initialization Vector (IV) generated per chunk.
+- **Content Deduplication**: SHA-256 chunk hashing and deduplication preventing redundant storage while maintaining individual file encryption.
+- **Secure Share Links**: Cryptographically signed, expiring download links with access control.
 
-```
-POST /api/share/create       → { shareUrl, ttlMinutes }
-GET  /api/share/{token}      → file download (public, no auth needed)
-DELETE /api/share/{token}    → revoke immediately
-```
+### 4. Parallel Chunked Storage Architecture
+- **Distributed Object Storage**: Powered by MinIO S3-compatible storage.
+- **High-Throughput Parallel Pipeline**: Large files are segmented into configurable chunks (default: 2 MB / 8 MB) and processed concurrently using Java `CompletableFuture` and thread pools.
+- **Resumable Uploads**: Robust progress tracking and chunk reassembly.
 
-### ♻️ SHA-256 Chunk-Level Deduplication
-Two users uploading the same 4 GB file? MinIO stores it once. Deduplication works at the chunk level — even files that are 80% identical share the chunks they have in common. Reference counting ensures nothing is deleted until every file pointing to it is gone.
-
-```
-Same file, different name      → 1 copy stored  ✅
-Same file, different user      → 1 copy stored  ✅
-File with 1 byte changed       → only that chunk is re-stored
-```
-
-### ⏸️ Resumable Uploads
-Upload interrupted at 78%? No problem. Resume from the exact chunk that failed. The backend tracks session state in PostgreSQL — chunks already received are idempotent and safe to skip. Sessions stay alive for 48 hours.
-
-```
-POST /api/files/upload/init              → sessionId, totalChunks
-PUT  /api/files/upload/chunk             → upload one chunk (idempotent)
-GET  /api/files/upload/{id}/status       → which chunks are done
-POST /api/files/upload/{id}/commit       → finalise the file
-```
+### 5. Authentication & Access Control
+- **Stateless JWT Security**: Spring Security filter chain validates Bearer tokens on protected REST and SSE streaming endpoints.
+- **Ownership-Enforced Authorization**: All file downloads, deletions, sharing, indexing, and AI interactions require ownership validation.
 
 ---
 
-## Tech Stack
+## 🏗️ System Architecture
 
-| Layer | Technology |
-|-------|-----------|
-| Backend | Spring Boot 3, Java 17 |
-| Database | PostgreSQL (JPA / Hibernate) |
-| Object Storage | MinIO (S3-compatible) |
-| Encryption | AES-256-GCM (javax.crypto) |
-| Auth | Spring Security + JWT |
-| Frontend | React, TypeScript |
-| Build | Maven |
-
----
-
-## Architecture
-
-```
-Client (React TSX)
-       │
-       ▼
-Spring Boot REST API
-       │
-       ├── EncryptionService   (AES-256-GCM, per-chunk IV)
-       │
-       ├── DeduplicationService (SHA-256 hash → chunk_hashes table)
-       │
-       ├── ResumableUploadService (session state in upload_sessions)
-       │
-       ├── ShareService        (signed tokens in share_tokens)
-       │
-       └── MinioService        (storeAtKey / getAtKey / deleteAtKey)
-              │
-              ▼
-           MinIO
-        (encrypted chunks at dedup/<sha256>)
-              │
-              ▼
-         PostgreSQL
-  (metadata, keys, sessions, tokens)
+```text
+               +--------------------------------------------------+
+               |             React + TypeScript Client            |
+               +--------------------------------------------------+
+                                  |                 |
+                   REST (JWT / Chunk Upload)   SSE Flux (RAG Stream)
+                                  v                 v
+               +--------------------------------------------------+
+               |              Spring Boot REST API Layer          |
+               |  (SecurityConfig, AuthTokenFilter, Controllers)  |
+               +--------------------------------------------------+
+                    |                      |                    |
+        +-----------v-----------+          |          +---------v-----------+
+        |   File Service Engine |          |          | Spring AI / RAG Engine
+        |  - AES-256-GCM Crypt  |          |          |  - DocumentExtraction
+        |  - Parallel Chunking  |          |          |  - RagIngestionService
+        |  - Deduplication      |          |          |  - RagService (Stream)
+        +-----------------------+          |          |  - AiHistoryService |
+                    |                      |          +---------------------+
+                    v                      v                    |
+        +-----------------------+ +------------------+          v
+        |  MinIO Object Storage | | PostgreSQL 16+   | +--------------------+
+        |  (Encrypted Chunks)   | | - Metadata       | |   Ollama Engine    |
+        |                       | | - ai_history     | | - nomic-embed-text |
+        |                       | | - pgvector (HNSW)| | - qwen3:8b (LLM)   |
+        +-----------------------+ +------------------+ +--------------------+
 ```
 
 ---
 
-## Database Schema
+## 🛠️ Tech Stack
 
-```
-users               — accounts
-file_metadata       — file records, encryption keys, owner
-share_tokens        — signed share URLs with TTL and password hash
-chunk_hashes        — SHA-256 → MinIO object key + reference count
-file_chunk_map      — file + chunkIndex → chunk hash (dedup index)
-upload_sessions     — resumable upload state, uploaded chunk tracking
-```
-
-> `spring.jpa.hibernate.ddl-auto=update` creates all tables automatically on first boot.
+| Technology | Purpose |
+|---|---|
+| **Java 25 / 21** | Core backend language |
+| **Spring Boot 3.x** | Enterprise REST API and application framework |
+| **Spring AI (2.0.1 BOM)** | Vector store and LLM integration abstraction |
+| **Ollama** | Local LLM (`qwen3:8b`) & embedding model (`nomic-embed-text`) inference |
+| **PostgreSQL + PGVector** | Relational metadata store & HNSW vector similarity search |
+| **Apache PDFBox 3.0** | Text extraction and preprocessing from PDF documents |
+| **MinIO** | High-performance distributed S3-compatible object storage |
+| **Project Reactor (Flux)** | Reactive streaming for Server-Sent Events (SSE) |
+| **Spring Security & JJWT** | Stateless authentication and RBAC filters |
+| **AES-256-GCM** | Authenticated symmetric encryption at rest |
+| **CompletableFuture** | Concurrent thread-pool chunk encryption and uploads |
+| **Maven & Lombok** | Build tooling, dependency management, and boilerplate reduction |
 
 ---
 
-## Getting Started
+## 📁 Project Structure
 
-### Prerequisites
-- Java 17+
-- Maven
-- PostgreSQL 14+
-- MinIO (or any S3-compatible store)
+```text
+src/main/java/com/cloudvault
+├── chunking/          # Parallel chunk segmentation & reassembly
+├── config/            # SecurityConfig, CorsConfig, StorageConfig
+├── controller/        # REST & SSE Controllers
+│   ├── AiController.java           # AI diagnostics & testing
+│   ├── AuthController.java         # User registration & login
+│   ├── DocumentAiController.java   # Document analysis SSE stream & history
+│   ├── FileController.java         # File upload, download, metadata, share
+│   └── RagController.java          # Vector indexing & RAG queries
+├── dto/               # Request & response payloads (DocumentAiRequest, etc.)
+├── encryption/        # AES-256-GCM cryptographic routines & key generation
+├── entity/            # JPA entities (User, FileMetadata, AiHistory, etc.)
+├── filter/            # JWT authentication filter
+├── model/             # Domain models & enums (AiIndexStatus)
+├── repository/        # Spring Data JPA repositories (AiHistoryRepository, etc.)
+├── security/          # JWT token provider & security contexts
+├── service/           # Core business & processing services
+│   ├── AiHistoryService.java       # Interaction history persistence & queries
+│   ├── AiService.java              # Direct LLM invocation
+│   ├── DocumentExtractionService.java # Apache PDFBox document parsing
+│   ├── FileService.java            # File lifecycle & encryption management
+│   ├── RagIngestionService.java    # Text chunking & PGVector store ingestion
+│   └── RagService.java             # RAG similarity retrieval & streaming synthesis
+└── util/              # Common helpers
+```
 
-### 1. Clone the repo
+---
+
+## 📡 API Reference
+
+### 🤖 Document Intelligence & RAG Endpoints
+
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `POST` | `/api/ai/documents/{fileId}` | Streams analysis (`SUMMARY`, `DETAILED_NOTES`, `QUESTION`) via SSE (`text/event-stream`) and automatically persists response to history | `Bearer JWT` |
+| `GET` | `/api/ai/documents/{fileId}/history` | Retrieves all past AI interactions and Q&A history for the given file | `Bearer JWT` |
+| `POST` | `/api/rag/ingest/{fileId}` | Manually triggers text extraction and PGVector indexing for a file | `Bearer JWT` |
+| `GET` | `/api/rag/status/{fileId}` | Checks the current AI vector indexing status (`NOT_INDEXED`, `INDEXING`, `READY`, `FAILED`) | `Bearer JWT` |
+
+#### Example: Stream Document Analysis Request
+```http
+POST /api/ai/documents/42 HTTP/1.1
+Host: localhost:8080
+Authorization: Bearer <your-jwt-token>
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "action": "QUESTION",
+  "question": "What are the primary performance metrics mentioned in this report?"
+}
+```
+
+#### Example: Get Interaction History Response
+```json
+[
+  {
+    "id": 1,
+    "fileId": 42,
+    "username": "mrugesh",
+    "action": "QUESTION",
+    "question": "What are the primary performance metrics mentioned in this report?",
+    "response": "The report highlights three primary metrics: 1. Upload latency reduced by 40%...",
+    "createdAt": "2026-10-07T21:45:00"
+  }
+]
+```
+
+### 🔐 Authentication Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/auth/register` | Register new user account |
+| `POST` | `/api/auth/login` | Authenticate user and receive JWT bearer token |
+
+### 📁 File Management & Sharing Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/files/init-upload` | Initialize chunked upload session |
+| `POST` | `/api/files/upload-chunk` | Upload encrypted chunk |
+| `POST` | `/api/files/complete-upload` | Finalize upload, trigger reassembly & deduplication |
+| `GET` | `/api/files` | List all files belonging to authenticated user |
+| `GET` | `/api/files/{id}/download` | Download and stream decrypted file |
+| `DELETE` | `/api/files/{id}` | Permanently delete file metadata and unreferenced chunks |
+| `POST` | `/api/files/{id}/share` | Generate secure time-limited share link |
+
+---
+
+## ⚙️ Configuration & Setup
+
+### 1. Prerequisites
+- **Java 21 or 25**
+- **Maven 3.9+**
+- **PostgreSQL 16+** with the **`pgvector`** extension installed
+- **MinIO Server** running locally or in Docker
+- **Ollama** installed with required models
+
+### 2. Ollama Model Setup
+Ensure Ollama is running and pull the chat and embedding models:
 ```bash
-git clone https://github.com/YOUR_USERNAME/cloudvault.git
-cd cloudvault
+ollama serve
+ollama pull qwen3:8b
+ollama pull nomic-embed-text
 ```
 
-### 2. Create the database
+### 3. Database & PGVector Setup
+Ensure the `vector` extension is created in your PostgreSQL database:
 ```sql
 CREATE DATABASE cloudvault;
+\c cloudvault;
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-### 3. Start MinIO
-```bash
-minio.exe server C:\minio-data --console-address ":9001"
-# Console → http://localhost:9001
-# Create a bucket named: cloudvault
-```
-
-### 4. Configure application.properties
+### 4. Configure `application.properties`
+Set up your connection strings and credentials:
 ```properties
-spring.datasource.url=jdbc:postgresql://localhost:5432/cloudvault
+# Database & PGVector
+spring.datasource.url=jdbc:postgresql://localhost:5433/cloudvault
 spring.datasource.username=postgres
 spring.datasource.password=yourpassword
+spring.jpa.hibernate.ddl-auto=update
 
+# MinIO Object Storage
 minio.url=http://127.0.0.1:9000
 minio.accessKey=minioadmin
 minio.secretKey=minioadmin
 minio.bucket=cloudvault
 
-app.base-url=http://localhost:8080
-app.dedup-key=YOUR_BASE64_AES_256_KEY
+# Ollama LLM & Embeddings
+spring.ai.ollama.base-url=http://localhost:11434
+spring.ai.ollama.chat.model=qwen3:8b
+spring.ai.ollama.chat.options.temperature=0.2
+spring.ai.ollama.embedding.model=nomic-embed-text
+
+# PGVector Index Settings
+spring.ai.vectorstore.pgvector.initialize-schema=true
+spring.ai.vectorstore.pgvector.index-type=HNSW
+spring.ai.vectorstore.pgvector.distance-type=COSINE_DISTANCE
+spring.ai.vectorstore.pgvector.dimensions=768
 ```
 
-Generate the dedup key (PowerShell):
-```powershell
-[Convert]::ToBase64String((1..32 | ForEach-Object { [byte](Get-Random -Max 256) }))
-```
-
-### 5. Run
+### 5. Build and Run
 ```bash
-mvn spring-boot:run
+cd cloudvault-backend
+./mvnw clean spring-boot:run
+```
+The server will start on `http://localhost:8080`.
+
+---
+
+## 🐳 Docker Deployment
+A standalone `Dockerfile` is provided for containerizing the backend:
+```bash
+docker build -t cloudvault-backend .
+docker run -p 8080:8080 --name cloudvault-backend cloudvault-backend
 ```
 
 ---
 
-## API Reference
-
-### Auth
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/auth/register` | Register a new user |
-| POST | `/api/auth/login` | Login, receive JWT |
-
-### Files
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/files/upload` | Standard encrypted upload |
-| GET | `/api/files/download/{id}` | Download and decrypt |
-| GET | `/api/files/list` | List your files |
-
-### Share Links
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/share/create` | Generate signed URL |
-| GET | `/api/share/{token}` | Public download via link |
-| DELETE | `/api/share/{token}` | Revoke a link |
-
-### Resumable Uploads
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/files/upload/init` | Start a session |
-| PUT | `/api/files/upload/chunk` | Upload one chunk |
-| GET | `/api/files/upload/{id}/status` | Check progress |
-| POST | `/api/files/upload/{id}/commit` | Finalise upload |
-
----
-
-## Security Design
-
-**Encryption** — AES-256-GCM with a fresh 96-bit IV per chunk. The IV is prepended to the ciphertext so no extra DB column is needed. Auth tags prevent silent corruption.
-
-**Share tokens** — 48 bytes of `SecureRandom` output encoded as URL-safe Base64. 2^384 possible values. Brute force is not a realistic attack. Tokens are validated against expiry, revocation, and an optional BCrypt password on every request.
-
-**Deduplication key separation** — Deduplicated chunks use a global key; per-file metadata keys are separate. A compromised dedup key does not expose per-user encryption keys.
-
-**Ownership checks** — Every file operation validates that the requesting user owns the file before any work is done.
-
----
-
-## Project Structure
-
-```
-src/main/java/com/cloudvault/
-├── controller/
-│   ├── FileController.java
-│   ├── ShareController.java
-│   └── ResumableUploadController.java
-├── service/
-│   ├── FileService.java
-│   ├── EncryptionService.java
-│   ├── MinioService.java
-│   ├── ShareService.java
-│   ├── DeduplicationService.java
-│   └── ResumableUploadService.java
-├── model/
-│   ├── User.java
-│   ├── FileMetadata.java
-│   ├── ShareToken.java
-│   ├── ChunkHash.java
-│   ├── FileChunkMap.java
-│   └── UploadSession.java
-└── repository/
-    ├── UserRepository.java
-    ├── FileRepository.java
-    ├── ShareTokenRepository.java
-    ├── ChunkHashRepository.java
-    ├── FileChunkMapRepository.java
-    └── UploadSessionRepository.java
-```
-
----
-
-## Interview Talking Points
-
-If you're using this project in campus placements, these are the strongest angles:
-
-**On encryption:** "Each chunk gets a unique IV — reusing IVs in GCM mode is catastrophic because it breaks both confidentiality and the authentication tag. I generate a fresh IV per chunk using SecureRandom and prepend it to the ciphertext so decrypt always has it without a separate DB column."
-
-**On deduplication:** "SHA-256 is computed over plaintext before encryption. Two users uploading the same file produce the same hash regardless of their individual keys. The dedup key encrypts the canonical stored copy. Reference counting ensures MinIO objects are only deleted when no file points to them anymore."
-
-**On resumable uploads:** "The protocol is idempotent at the chunk level — if a chunk upload succeeds but the client crashes before receiving the 200, it can safely retry. The backend checks the uploaded chunk set and skips duplicates. On reconnect, the client calls /status to get the exact set of missing indices and resumes from there."
-
-**On parallel transfer:** "CompletableFuture.allOf() lets all chunks fly in parallel. I snapshot the entity fields — encryptionKey, totalChunks — on the main thread before handing work to the executor pool. Accessing Hibernate-managed fields from async threads risks detached-entity exceptions if the session closes."
-
----
-
-## License
-
-MIT — use it, fork it, learn from it.
-
----
-
-<p align="center">Built with Java, grit, and an unreasonable amount of attention to chunk boundaries.</p>
+## 👤 Author
+**Mrugesh Patil**
+- Backend Engineering | Distributed Systems | Applied AI & Security
