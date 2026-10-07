@@ -98,4 +98,22 @@ public class FileController {
         String username = authentication.getName();
         return ResponseEntity.ok(fileService.getUserFiles(username));
     }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<?> deleteFile(
+            @PathVariable Long id,
+            Principal principal
+    ){
+        try{
+            String username = principal.getName();
+            fileService.deleteFile(id,username);
+            return ResponseEntity.ok("File deleted successfully");
+
+        }catch (SecurityException e){
+            return ResponseEntity.status(403).body("Access denied");
+        }catch (Exception e){
+            log.error("Delete failed for fileId={}", id, e);
+            return ResponseEntity.internalServerError().body(e.getMessage());
+        }
+    }
 }

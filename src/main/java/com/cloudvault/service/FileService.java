@@ -1,10 +1,12 @@
 package com.cloudvault.service;
 
+import com.cloudvault.model.AiIndexStatus;
 import com.cloudvault.model.FileMetadata;
 import com.cloudvault.model.User;
 import com.cloudvault.repository.FileRepository;
 import com.cloudvault.repository.UserRepository;
 import jakarta.annotation.PreDestroy;
+import org.springframework.transaction.annotation.Transactional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -31,12 +33,26 @@ public class FileService {
     @Autowired
     private EncryptionService encryptionService;
 
+    public final DeduplicationService deduplicationService;
+
     @Autowired
     private MinioService minioService;
 
     private static final int CHUNK_SIZE = 2 * 1024 * 1024;
 
     private final ExecutorService executor = Executors.newFixedThreadPool(4);
+
+    public FileService(
+            FileRepository fileRepository,
+            MinioService minioService,
+            EncryptionService encryptionService,
+            DeduplicationService deduplicationService
+    ) {
+        this.fileRepository = fileRepository;
+        this.minioService = minioService;
+        this.encryptionService = encryptionService;
+        this.deduplicationService = deduplicationService;
+    }
 
     @PreDestroy
     public void shutdownExecutor() {
@@ -101,9 +117,13 @@ public class FileService {
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                     if (firstError.get() != null) return;
                     try {
-                        byte[] encrypted = encryptionService.encrypt(chunkToProcess, fileKey);
-                        minioService.storeChunk(encrypted, savedMetadata.getId(), index);
-                        log.info("Chunk {} uploaded successfully", index);
+                        deduplicationService.storeChunk(
+                                chunkToProcess,
+                                savedMetadata,
+                                index
+                        );
+
+                        log.info("Chunk {} uploaded successfully with deduplication", index);
                     } catch (Exception e) {
                         firstError.compareAndSet(null, e);
                         throw new CompletionException("Failed to upload chunk " + index, e);
@@ -169,13 +189,10 @@ public class FileService {
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                 if (firstError.get() != null) return;
                 try {
-                    byte[] encrypted = minioService.getChunk(fileId, index);
+                    byte[] decryptedChunk =
+                            deduplicationService.retrieveChunk(metadata, index);
 
-                    // FIX: use the snapshotted key — not metadata.getEncryptionKey()
-                    //      which could be null if Hibernate detaches the entity
-                    byte[] decrypted = encryptionService.decrypt(encrypted, encryptionKey);
-
-                    allChunks[index] = decrypted;
+                    allChunks[index] = decryptedChunk;
                     log.info("Chunk {} downloaded and decrypted", index);
 
                 } catch (Exception e) {
@@ -201,5 +218,46 @@ public class FileService {
             outputStream.write(chunk);
         }
         return outputStream.toByteArray();
+    }
+
+    @Transactional
+    public void deleteFile(Long id, String username) throws Exception {
+        FileMetadata metadata = fileRepository.findById(id)
+                .orElseThrow(()->
+                        new RuntimeException("File not found with id: " + id));
+        if (!metadata.getOwner().getUsername().equals(username)) {
+            throw new SecurityException("Access denied: you do not own this file");
+        }
+
+        log.info("Deleting file id={}, name={}, owner={}",
+                id,metadata.getFileName(),
+                username);
+        deduplicationService.deleteChunksForFile(metadata);
+        fileRepository.delete(metadata);
+        log.info("Deleted file id={}", id);
+    }
+
+    @Transactional
+    public void updateAiIndexStatus(
+            Long fileId,
+            AiIndexStatus status) {
+
+        FileMetadata metadata =
+                fileRepository.findById(fileId)
+                        .orElseThrow(() ->
+                                new RuntimeException(
+                                        "File not found with id: " + fileId
+                                )
+                        );
+
+        metadata.setAiIndexStatus(status);
+
+        fileRepository.save(metadata);
+
+        log.info(
+                "AI index status updated: fileId={}, status={}",
+                fileId,
+                status
+        );
     }
 }

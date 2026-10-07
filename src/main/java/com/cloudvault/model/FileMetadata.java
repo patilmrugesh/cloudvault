@@ -3,6 +3,9 @@ package com.cloudvault.model;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.*;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Column;
 
 import java.time.LocalDateTime;
 
@@ -14,6 +17,11 @@ import java.time.LocalDateTime;
 @AllArgsConstructor
 @Builder
 public class FileMetadata {
+
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private AiIndexStatus aiIndexStatus = AiIndexStatus.NOT_INDEXED;
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
